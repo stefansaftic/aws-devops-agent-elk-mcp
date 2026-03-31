@@ -1,0 +1,24 @@
+{
+  "name": "elk-demo-service",
+  "version": "1.0.0",
+  "description": "Demo service that generates logs and metrics into Elasticsearch with triggerable error scenarios",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ec2": "^3.1016.0",
+    "@elastic/elasticsearch": "^8.17.0",
+    "dockerode": "^4.0.10",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "@types/dockerode": "^4.0.1",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}

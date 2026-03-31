@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+
+# Environment (secrets)
+.env
+
+# Internal dev/debug scripts
+internal/
+
+# Lock files (contain local paths)
+package-lock.json
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Native binaries
+*.node
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+docker-compose.override.yml

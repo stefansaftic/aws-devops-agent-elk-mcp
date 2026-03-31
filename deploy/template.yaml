@@ -1,0 +1,845 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ELK MCP Server for AWS DevOps Agent — EC2 + API Gateway deployment.
+  Runs Elasticsearch, MCP Server, and Demo Service on a private EC2 instance
+  exposed via API Gateway HTTP API through a VPC Link + NLB.
+  Uses ECR for Docker images and S3 for code bundle (no internet access needed).
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type (t3.medium = 2 vCPU, 4GB RAM — minimum for Elasticsearch)
+    AllowedValues: [t3.medium, t3.large, t3.xlarge]
+
+  OAuthClientSecret:
+    Type: String
+    Default: demo-secret-change-me
+    NoEcho: true
+    Description: OAuth client secret for MCP server authentication
+
+  JwtSecret:
+    Type: String
+    Default: jwt-secret-change-me-in-production
+    NoEcho: true
+    Description: JWT signing secret
+
+  AutoShutdownMinutes:
+    Type: Number
+    Default: 120
+    Description: Auto-shutdown timer in minutes (default 2 hours)
+
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: (Optional) EC2 Key Pair name for SSH access
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+
+Resources:
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # ECR Repositories (for Docker images)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  MCPServerRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${AWS::StackName}/mcp-server'
+      ImageScanningConfiguration:
+        ScanOnPush: false
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"selection":{"tagStatus":"untagged","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}
+
+  DemoServiceRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${AWS::StackName}/demo-service'
+      ImageScanningConfiguration:
+        ScanOnPush: false
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"selection":{"tagStatus":"untagged","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}
+
+  ElasticsearchRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${AWS::StackName}/elasticsearch'
+      ImageScanningConfiguration:
+        ScanOnPush: false
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"selection":{"tagStatus":"untagged","countType":"imageCountMoreThan","countNumber":3},"action":{"type":"expire"}}]}
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # S3 Bucket (for code bundle: docker-compose.yml, .env, etc.)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  CodeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-code-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldVersions
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # VPC & Networking
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-a'
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-b'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private-rt'
+
+  PrivateSubnetARouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # VPC Endpoints (no NAT Gateway needed)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for VPC endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpce-sg'
+
+  # SSM endpoints (for Session Manager access)
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA]
+      SecurityGroupIds: [!Ref VPCEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA]
+      SecurityGroupIds: [!Ref VPCEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA]
+      SecurityGroupIds: [!Ref VPCEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # ECR endpoints (for Docker image pulls)
+  ECRApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA]
+      SecurityGroupIds: [!Ref VPCEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  ECRDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA]
+      SecurityGroupIds: [!Ref VPCEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # S3 Gateway endpoint (for ECR image layers + code bundle)
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTable]
+
+  # EC2 endpoint (for self-shutdown via ec2:StopInstances)
+  EC2ApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2'
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA]
+      SecurityGroupIds: [!Ref VPCEndpointSecurityGroup]
+      PrivateDnsEnabled: true
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Security Groups
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for ELK MCP EC2 instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 3001
+          ToPort: 3001
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ec2-sg'
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # IAM Role for EC2
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ECRAndS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ECR: pull images
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+              # S3: read code bundle
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${CodeBucket}'
+                  - !Sub 'arn:aws:s3:::${CodeBucket}/*'
+              # EC2: self-shutdown
+              - Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'ec2:ResourceTag/aws:cloudformation:stack-name': !Ref AWS::StackName
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2Role]
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # EC2 Instance
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - ECRApiEndpoint
+      - ECRDkrEndpoint
+      - S3Endpoint
+      - SSMEndpoint
+      - EC2ApiEndpoint
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroupIds: [!Ref EC2SecurityGroup]
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-instance'
+      UserData:
+        Fn::Base64:
+          !Sub
+            - |
+              #!/bin/bash
+              # UserData: install base packages and create the idempotent setup script.
+              # Does NOT fail if S3 files aren't ready yet — the systemd service retries.
+
+              REGION="${AWS::Region}"
+              ACCOUNT_ID="${AWS::AccountId}"
+              STACK_NAME="${AWS::StackName}"
+              BUCKET_NAME="${BucketName}"
+              ECR_URL="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com"
+
+              exec > >(tee /var/log/elk-mcp-userdata.log | logger -t elk-mcp-userdata) 2>&1
+              echo "=== UserData started at $(date) ==="
+
+              # ─── Install base packages ──────────────────────────────────────
+              dnf install -y docker at
+              systemctl enable docker
+              systemctl start docker
+              systemctl enable atd
+              systemctl start atd
+              usermod -aG docker ec2-user
+
+              # ─── Sysctl for Elasticsearch ───────────────────────────────────
+              sysctl -w vm.max_map_count=262144
+              echo "vm.max_map_count=262144" >> /etc/sysctl.conf
+
+              # ─── Create .env file (written once from CloudFormation params) ──
+              mkdir -p /opt/app
+              cat > /opt/app/.env << 'ENVEOF'
+              OAUTH_CLIENT_SECRET=${OAuthClientSecret}
+              JWT_SECRET=${JwtSecret}
+              DEPLOY_ENV=ec2
+              AUTO_SHUTDOWN_MINUTES=${AutoShutdownMinutes}
+              ECR_URL=${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+              STACK_NAME=${AWS::StackName}
+              ENVEOF
+
+              # ─── Auto-shutdown helper ───────────────────────────────────────
+              cat > /usr/local/bin/auto-shutdown.sh << 'SHUTEOF'
+              #!/bin/bash
+              TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+              INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+              REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+              aws ec2 stop-instances --instance-ids "$INSTANCE_ID" --region "$REGION"
+              SHUTEOF
+              chmod +x /usr/local/bin/auto-shutdown.sh
+
+              # ─── Idempotent setup script (runs on every boot) ───────────────
+              # This script is safe to run multiple times:
+              #   - Retries S3 downloads if files aren't ready yet
+              #   - Skips steps already done (docker-compose installed, app extracted)
+              #   - Always refreshes ECR login (tokens expire every 12h)
+              #   - Always ensures Docker Compose is running
+              cat > /usr/local/bin/elk-mcp-setup.sh << 'SETUPEOF'
+              #!/bin/bash
+              set -e
+              exec >> /var/log/elk-mcp-setup.log 2>&1
+              echo "=== elk-mcp-setup started at $(date) ==="
+
+              source /opt/app/.env
+
+              REGION=$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 21600')" http://169.254.169.254/latest/meta-data/placement/region)
+
+              # ── Step 1: Install Docker Compose (retry until S3 file is ready)
+              if [ ! -f /usr/local/bin/docker-compose ]; then
+                echo "Installing Docker Compose from S3..."
+                for i in $(seq 1 60); do
+                  if aws s3 cp "s3://$BUCKET_NAME/docker-compose-linux-x86_64" /usr/local/bin/docker-compose --region "$REGION" 2>/dev/null; then
+                    echo "Docker Compose downloaded on attempt $i"
+                    break
+                  fi
+                  echo "Attempt $i: S3 not ready yet, retrying in 10s..."
+                  sleep 10
+                done
+                if [ ! -f /usr/local/bin/docker-compose ]; then
+                  echo "ERROR: Failed to download Docker Compose after 60 attempts"
+                  exit 1
+                fi
+                chmod +x /usr/local/bin/docker-compose
+                ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+                mkdir -p /usr/local/lib/docker/cli-plugins
+                ln -sf /usr/local/bin/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
+                echo "Docker Compose installed: $(docker-compose --version)"
+              else
+                echo "Docker Compose already installed: $(docker-compose --version)"
+              fi
+
+              # ── Step 2: Download app bundle (retry until S3 file is ready)
+              if [ ! -f /opt/app/docker-compose.ec2.yml ]; then
+                echo "Downloading app bundle from S3..."
+                for i in $(seq 1 60); do
+                  if aws s3 cp "s3://$BUCKET_NAME/app-bundle.tar.gz" /opt/app/app-bundle.tar.gz --region "$REGION" 2>/dev/null; then
+                    echo "App bundle downloaded on attempt $i"
+                    break
+                  fi
+                  echo "Attempt $i: S3 not ready yet, retrying in 10s..."
+                  sleep 10
+                done
+                if [ ! -f /opt/app/app-bundle.tar.gz ]; then
+                  echo "ERROR: Failed to download app bundle after 60 attempts"
+                  exit 1
+                fi
+                cd /opt/app && tar xzf app-bundle.tar.gz && rm -f app-bundle.tar.gz
+                echo "App bundle extracted"
+              else
+                echo "App bundle already extracted"
+              fi
+
+              # ── Step 3: ECR Login (always refresh — tokens expire every 12h)
+              echo "Logging into ECR..."
+              aws ecr get-login-password --region "$REGION" | docker login --username AWS --password-stdin "$ECR_URL"
+              echo "ECR login successful"
+
+              # ── Step 4: Start Docker Compose
+              echo "Starting Docker Compose..."
+              cd /opt/app
+              docker compose -f docker-compose.ec2.yml up -d
+              echo "Docker Compose started"
+
+              # ── Step 5: Schedule auto-shutdown
+              echo "Scheduling auto-shutdown in $AUTO_SHUTDOWN_MINUTES minutes..."
+              SHUTDOWN_AT=$(date -d "+$AUTO_SHUTDOWN_MINUTES minutes" +%s)
+              echo "$SHUTDOWN_AT" > /tmp/shutdown-at
+              # Cancel any existing shutdown jobs
+              atrm $(atq | awk '{print $1}') 2>/dev/null || true
+              echo "/usr/local/bin/auto-shutdown.sh" | at now + "$AUTO_SHUTDOWN_MINUTES" minutes
+              echo "Auto-shutdown scheduled"
+
+              echo "=== elk-mcp-setup completed successfully at $(date) ==="
+              SETUPEOF
+              # Inject BUCKET_NAME into the setup script (it's a CloudFormation variable)
+              sed -i "s|\$BUCKET_NAME|${BucketName}|g" /usr/local/bin/elk-mcp-setup.sh
+              chmod +x /usr/local/bin/elk-mcp-setup.sh
+
+              # ─── Systemd service: runs setup on every boot ──────────────────
+              cat > /etc/systemd/system/elk-mcp.service << 'SVCEOF'
+              [Unit]
+              Description=ELK MCP Demo Stack
+              After=docker.service network-online.target
+              Requires=docker.service
+              Wants=network-online.target
+
+              [Service]
+              Type=oneshot
+              RemainAfterExit=yes
+              ExecStart=/usr/local/bin/elk-mcp-setup.sh
+              ExecStop=/usr/local/bin/docker-compose -f /opt/app/docker-compose.ec2.yml down
+              TimeoutStartSec=600
+              StandardOutput=journal
+              StandardError=journal
+
+              [Install]
+              WantedBy=multi-user.target
+              SVCEOF
+              systemctl daemon-reload
+              systemctl enable elk-mcp.service
+
+              # ─── Start the setup now (first boot) ───────────────────────────
+              echo "=== Launching elk-mcp-setup.sh in background ==="
+              nohup /usr/local/bin/elk-mcp-setup.sh &
+
+              echo "=== UserData completed at $(date) ==="
+            - BucketName: !Ref CodeBucket
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Network Load Balancer (Internal)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  NLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${AWS::StackName}-nlb'
+      Scheme: internal
+      Type: network
+      Subnets:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+
+  MCPTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-mcp-tg'
+      Port: 3000
+      Protocol: TCP
+      VpcId: !Ref VPC
+      TargetType: instance
+      Targets:
+        - Id: !Ref EC2Instance
+          Port: 3000
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '3000'
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  DashboardTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-dash-tg'
+      Port: 3001
+      Protocol: TCP
+      VpcId: !Ref VPC
+      TargetType: instance
+      Targets:
+        - Id: !Ref EC2Instance
+          Port: 3001
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: '3001'
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  MCPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref NLB
+      Port: 3000
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref MCPTargetGroup
+
+  DashboardListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref NLB
+      Port: 3001
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref DashboardTargetGroup
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # API Gateway HTTP API
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  VpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: !Sub '${AWS::StackName}-vpc-link'
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      SecurityGroupIds: []
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      ProtocolType: HTTP
+      Description: Public HTTPS endpoint for ELK MCP Server
+
+  MCPIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !Ref MCPListener
+      PayloadFormatVersion: '1.0'
+
+  DashboardIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      ConnectionType: VPC_LINK
+      ConnectionId: !Ref VpcLink
+      IntegrationUri: !Ref DashboardListener
+      PayloadFormatVersion: '1.0'
+
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt InstanceManagerFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  MCPRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'ANY /{proxy+}'
+      Target: !Sub 'integrations/${MCPIntegration}'
+
+  MCPRootRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'ANY /'
+      Target: !Sub 'integrations/${MCPIntegration}'
+
+  DashboardRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'ANY /dashboard/{proxy+}'
+      Target: !Sub 'integrations/${DashboardIntegration}'
+
+  DashboardRootRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /dashboard'
+      Target: !Sub 'integrations/${DashboardIntegration}'
+
+  InstanceStartRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /instance/start'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  InstanceStopRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /instance/stop'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  InstanceStatusRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /instance/status'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # Lambda: Instance Manager (Start/Stop/Status)
+  # ═══════════════════════════════════════════════════════════════════════════
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2Management
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StartInstances
+                  - ec2:StopInstances
+                  - ec2:DescribeInstances
+                Resource: '*'
+
+  InstanceManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-instance-manager'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          INSTANCE_ID: !Ref EC2Instance
+          REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+
+          ec2 = boto3.client('ec2', region_name=os.environ['REGION'])
+          INSTANCE_ID = os.environ['INSTANCE_ID']
+
+          def handler(event, context):
+              path = event.get('rawPath', '')
+              method = event.get('requestContext', {}).get('http', {}).get('method', 'GET')
+
+              try:
+                  if path == '/instance/start' and method == 'POST':
+                      ec2.start_instances(InstanceIds=[INSTANCE_ID])
+                      state = get_state()
+                      return response(200, {
+                          'action': 'start',
+                          'instanceId': INSTANCE_ID,
+                          'state': state,
+                          'message': 'Instance starting. Docker Compose will be ready in ~2 minutes.'
+                      })
+
+                  elif path == '/instance/stop' and method == 'POST':
+                      ec2.stop_instances(InstanceIds=[INSTANCE_ID])
+                      state = get_state()
+                      return response(200, {
+                          'action': 'stop',
+                          'instanceId': INSTANCE_ID,
+                          'state': state,
+                          'message': 'Instance stopping.'
+                      })
+
+                  elif path == '/instance/status':
+                      state = get_state()
+                      return response(200, {
+                          'instanceId': INSTANCE_ID,
+                          'state': state
+                      })
+
+                  else:
+                      return response(404, {'error': 'Not found'})
+
+              except Exception as e:
+                  return response(500, {'error': str(e)})
+
+          def get_state():
+              result = ec2.describe_instances(InstanceIds=[INSTANCE_ID])
+              return result['Reservations'][0]['Instances'][0]['State']['Name']
+
+          def response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps(body)
+              }
+
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InstanceManagerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Outputs
+# ═══════════════════════════════════════════════════════════════════════════
+
+Outputs:
+  ApiGatewayUrl:
+    Description: Public HTTPS URL for the MCP Server
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+  MCPEndpoint:
+    Description: MCP endpoint URL (for DevOps Agent registration)
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/mcp'
+
+  OAuthTokenEndpoint:
+    Description: OAuth token exchange URL (for DevOps Agent registration)
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/oauth/token'
+
+  DashboardUrl:
+    Description: Demo Dashboard URL
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/dashboard/'
+
+  InstanceId:
+    Description: EC2 Instance ID (for manual start/stop)
+    Value: !Ref EC2Instance
+
+  StartInstanceUrl:
+    Description: URL to start the EC2 instance
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/instance/start'
+
+  StopInstanceUrl:
+    Description: URL to stop the EC2 instance
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/instance/stop'
+
+  InstanceStatusUrl:
+    Description: URL to check EC2 instance status
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/instance/status'
+
+  SSMConnectCommand:
+    Description: Command to connect to EC2 via SSM Session Manager
+    Value: !Sub 'aws ssm start-session --target ${EC2Instance} --region ${AWS::Region}'
+
+  CodeBucketName:
+    Description: S3 bucket for code bundle
+    Value: !Ref CodeBucket
+
+  ECRMCPServerRepo:
+    Description: ECR repository for MCP Server image
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}/mcp-server'
+
+  ECRDemoServiceRepo:
+    Description: ECR repository for Demo Service image
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}/demo-service'
+
+  ECRElasticsearchRepo:
+    Description: ECR repository for Elasticsearch image
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}/elasticsearch'

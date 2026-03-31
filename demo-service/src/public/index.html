@@ -1,0 +1,525 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>🔥 ELK Demo - Scenario Trigger Panel</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container { max-width: 900px; margin: 0 auto; }
+    header {
+      text-align: center;
+      padding: 30px 0;
+      border-bottom: 1px solid #1e293b;
+      margin-bottom: 30px;
+    }
+    header h1 { font-size: 28px; margin-bottom: 8px; }
+    header p { color: #94a3b8; font-size: 14px; }
+    .status-bar {
+      background: #1e293b;
+      border-radius: 12px;
+      padding: 16px 24px;
+      margin-bottom: 30px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .status-dot {
+      width: 12px; height: 12px;
+      border-radius: 50%;
+      background: #22c55e;
+      animation: pulse 2s infinite;
+    }
+    .status-dot.error { background: #ef4444; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+    .status-text { font-size: 14px; color: #94a3b8; }
+    .status-text strong { color: #e2e8f0; }
+    .section-title {
+      font-size: 16px;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 16px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #1e293b;
+    }
+    .scenarios-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(400px, 1fr));
+      gap: 16px;
+      margin-bottom: 30px;
+    }
+    .scenario-card {
+      background: #1e293b;
+      border-radius: 12px;
+      padding: 20px;
+      border: 1px solid #334155;
+      transition: all 0.2s;
+    }
+    .scenario-card:hover { border-color: #475569; }
+    .scenario-card.active { border-color: #f59e0b; background: #1e293b; }
+    .scenario-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    .scenario-icon { font-size: 24px; }
+    .scenario-name { font-size: 16px; font-weight: 600; }
+    .scenario-duration {
+      margin-left: auto;
+      font-size: 12px;
+      color: #64748b;
+      background: #0f172a;
+      padding: 4px 10px;
+      border-radius: 20px;
+    }
+    .scenario-desc {
+      font-size: 13px;
+      color: #94a3b8;
+      line-height: 1.5;
+      margin-bottom: 14px;
+    }
+    .scenario-actions { display: flex; gap: 8px; }
+    .btn {
+      padding: 8px 20px;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+    .btn-trigger {
+      background: #3b82f6;
+      color: white;
+    }
+    .btn-trigger:hover { background: #2563eb; }
+    .btn-trigger:disabled {
+      background: #475569;
+      cursor: not-allowed;
+    }
+    .btn-stop {
+      background: #ef4444;
+      color: white;
+      display: none;
+    }
+    .btn-stop:hover { background: #dc2626; }
+    .scenario-card.active .btn-trigger { display: none; }
+    .scenario-card.active .btn-stop { display: inline-block; }
+    .remaining {
+      font-size: 12px;
+      color: #f59e0b;
+      display: none;
+      align-items: center;
+      gap: 4px;
+    }
+    .scenario-card.active .remaining { display: flex; }
+    .active-scenarios {
+      margin-bottom: 30px;
+    }
+    .active-list {
+      background: #1e293b;
+      border-radius: 12px;
+      padding: 16px 24px;
+    }
+    .active-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 0;
+      border-bottom: 1px solid #334155;
+    }
+    .active-item:last-child { border-bottom: none; }
+    .stop-all-btn {
+      background: #7f1d1d;
+      color: #fca5a5;
+      border: 1px solid #991b1b;
+      padding: 10px 24px;
+      border-radius: 8px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 16px;
+      transition: all 0.2s;
+    }
+    .stop-all-btn:hover { background: #991b1b; }
+    .toast {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 16px 24px;
+      font-size: 14px;
+      transform: translateY(100px);
+      opacity: 0;
+      transition: all 0.3s;
+      z-index: 100;
+    }
+    .toast.show { transform: translateY(0); opacity: 1; }
+    .toast.success { border-color: #22c55e; }
+    .toast.error { border-color: #ef4444; }
+    .empty-state {
+      text-align: center;
+      padding: 20px;
+      color: #64748b;
+      font-size: 14px;
+    }
+    /* EC2 Mode Panel */
+    .ec2-panel {
+      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+      border: 1px solid #f59e0b;
+      border-radius: 12px;
+      padding: 20px 24px;
+      margin-bottom: 30px;
+      display: none;
+    }
+    .ec2-panel.visible { display: block; }
+    .ec2-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .ec2-header h3 { font-size: 16px; color: #f59e0b; }
+    .ec2-badge {
+      background: #78350f;
+      color: #fbbf24;
+      font-size: 11px;
+      padding: 2px 10px;
+      border-radius: 20px;
+      font-weight: 600;
+    }
+    .ec2-timer {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .timer-display {
+      font-size: 28px;
+      font-weight: 700;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      color: #fbbf24;
+    }
+    .timer-display.warning { color: #ef4444; }
+    .timer-label {
+      font-size: 12px;
+      color: #94a3b8;
+    }
+    .ec2-actions {
+      display: flex;
+      gap: 8px;
+      margin-left: auto;
+    }
+    .btn-extend {
+      background: #f59e0b;
+      color: #0f172a;
+      font-weight: 700;
+    }
+    .btn-extend:hover { background: #d97706; }
+    .btn-shutdown {
+      background: #7f1d1d;
+      color: #fca5a5;
+      border: 1px solid #991b1b;
+    }
+    .btn-shutdown:hover { background: #991b1b; }
+    .mode-badge {
+      font-size: 11px;
+      padding: 2px 10px;
+      border-radius: 20px;
+      font-weight: 600;
+      margin-left: auto;
+    }
+    .mode-badge.local { background: #1e3a5f; color: #60a5fa; }
+    .mode-badge.ec2 { background: #78350f; color: #fbbf24; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🔥 ELK Demo — Scenario Trigger Panel</h1>
+      <p>Trigger error scenarios to generate logs in Elasticsearch, then investigate with AWS DevOps Agent</p>
+    </header>
+
+    <div class="status-bar">
+      <div class="status-dot" id="statusDot"></div>
+      <span class="status-text" id="statusText">Connecting...</span>
+      <span class="mode-badge" id="modeBadge" style="display:none;"></span>
+    </div>
+
+    <!-- Shutdown Timer Panel (both modes) -->
+    <div class="ec2-panel" id="timerPanel">
+      <div class="ec2-header">
+        <span id="panelIcon">⏱</span>
+        <h3 id="panelTitle">Stack Timer</h3>
+        <span class="ec2-badge">AUTO-SHUTDOWN</span>
+      </div>
+      <div class="ec2-timer">
+        <div>
+          <div class="timer-display" id="timerDisplay">--:--:--</div>
+          <div class="timer-label">Time remaining before auto-shutdown</div>
+        </div>
+        <div class="ec2-actions">
+          <button class="btn btn-extend" onclick="extendShutdown()">⏱ Extend +1h</button>
+          <button class="btn btn-shutdown" onclick="shutdownNow()">⏻ Shutdown Now</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="active-scenarios" id="activeSection" style="display:none;">
+      <div class="section-title">⚡ Active Scenarios</div>
+      <div class="active-list" id="activeList"></div>
+      <button class="stop-all-btn" onclick="stopAll()">🛑 Stop All Scenarios</button>
+    </div>
+
+    <div class="section-title">🎯 Trigger Error Scenarios</div>
+    <div class="scenarios-grid" id="scenariosGrid">
+      <div class="empty-state">Loading scenarios...</div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    // Detect base path (works at both / and /dashboard/)
+    const BASE_PATH = window.location.pathname.replace(/\/$/, '') || '';
+    function apiUrl(path) { return BASE_PATH + path; }
+
+    let refreshTimer;
+
+    async function fetchStatus() {
+      try {
+        const res = await fetch(apiUrl('/api/status'));
+        const data = await res.json();
+        renderStatus(data);
+        renderScenarios(data);
+        renderActive(data);
+      } catch (err) {
+        document.getElementById('statusDot').classList.add('error');
+        document.getElementById('statusText').innerHTML = '<strong>Disconnected</strong> — Cannot reach demo service';
+      }
+    }
+
+    function renderStatus(data) {
+      const dot = document.getElementById('statusDot');
+      const text = document.getElementById('statusText');
+      dot.classList.remove('error');
+      const activeCount = data.active.length;
+      if (activeCount > 0) {
+        text.innerHTML = `<strong>● Generating baseline logs</strong> + <strong style="color:#f59e0b">${activeCount} active scenario(s)</strong>`;
+      } else {
+        text.innerHTML = '<strong>● Generating baseline logs...</strong> All systems nominal';
+      }
+    }
+
+    function renderScenarios(data) {
+      const grid = document.getElementById('scenariosGrid');
+      grid.innerHTML = data.available.map(s => `
+        <div class="scenario-card ${s.isActive ? 'active' : ''}" id="card-${s.id}">
+          <div class="scenario-header">
+            <span class="scenario-icon">${s.icon}</span>
+            <span class="scenario-name">${s.name}</span>
+            <span class="scenario-duration">${s.duration}</span>
+          </div>
+          <div class="scenario-desc">${s.description}</div>
+          <div class="scenario-actions">
+            <button class="btn btn-trigger" onclick="trigger('${s.id}')" ${s.isActive ? 'disabled' : ''}>
+              ▶ Trigger
+            </button>
+            <button class="btn btn-stop" onclick="stop('${s.id}')">
+              ⏹ Stop
+            </button>
+            <span class="remaining" id="remaining-${s.id}"></span>
+          </div>
+        </div>
+      `).join('');
+
+      // Update remaining times
+      data.active.forEach(a => {
+        const el = document.getElementById(`remaining-${a.id}`);
+        if (el) {
+          el.textContent = `⏱ ${a.remainingSeconds}s remaining`;
+        }
+      });
+    }
+
+    function renderActive(data) {
+      const section = document.getElementById('activeSection');
+      const list = document.getElementById('activeList');
+
+      if (data.active.length === 0) {
+        section.style.display = 'none';
+        return;
+      }
+
+      section.style.display = 'block';
+      list.innerHTML = data.active.map(a => `
+        <div class="active-item">
+          <span>🔴</span>
+          <strong>${a.name}</strong>
+          <span style="color:#64748b;margin-left:auto;">⏱ ${a.remainingSeconds}s remaining</span>
+        </div>
+      `).join('');
+    }
+
+    async function trigger(id) {
+      try {
+        const res = await fetch(apiUrl(`/api/scenarios/${id}`), { method: 'POST' });
+        const data = await res.json();
+        showToast(data.message, data.success ? 'success' : 'error');
+        fetchStatus();
+      } catch (err) {
+        showToast('Failed to trigger scenario', 'error');
+      }
+    }
+
+    async function stop(id) {
+      try {
+        const res = await fetch(apiUrl(`/api/scenarios/${id}/stop`), { method: 'POST' });
+        const data = await res.json();
+        showToast(data.message, data.success ? 'success' : 'error');
+        fetchStatus();
+      } catch (err) {
+        showToast('Failed to stop scenario', 'error');
+      }
+    }
+
+    async function stopAll() {
+      try {
+        const res = await fetch(apiUrl('/api/scenarios/stop-all'), { method: 'POST' });
+        const data = await res.json();
+        showToast(data.message, data.success ? 'success' : 'error');
+        fetchStatus();
+      } catch (err) {
+        showToast('Failed to stop scenarios', 'error');
+      }
+    }
+
+    function showToast(message, type) {
+      const toast = document.getElementById('toast');
+      toast.textContent = message;
+      toast.className = `toast show ${type}`;
+      setTimeout(() => { toast.className = 'toast'; }, 3000);
+    }
+
+    // ─── Environment Detection & Timer (both modes) ───────────────
+    let remainingSeconds = null;
+    let timerInterval = null;
+    let currentMode = 'local';
+
+    async function fetchEnvironment() {
+      try {
+        const res = await fetch(apiUrl('/api/environment'));
+        const env = await res.json();
+        const badge = document.getElementById('modeBadge');
+        const panel = document.getElementById('timerPanel');
+        const panelIcon = document.getElementById('panelIcon');
+        const panelTitle = document.getElementById('panelTitle');
+
+        currentMode = env.mode || 'local';
+        badge.style.display = 'inline-block';
+
+        // Always show the timer panel
+        panel.classList.add('visible');
+
+        if (env.isEC2) {
+          badge.className = 'mode-badge ec2';
+          badge.textContent = '☁️ EC2';
+          panelIcon.textContent = '☁️';
+          panelTitle.textContent = 'EC2 Instance';
+        } else {
+          badge.className = 'mode-badge local';
+          badge.textContent = '🖥️ Local';
+          panelIcon.textContent = '🖥️';
+          panelTitle.textContent = 'Local Docker Stack';
+        }
+
+        if (env.remainingSeconds !== undefined) {
+          remainingSeconds = env.remainingSeconds;
+          startTimerCountdown();
+        }
+      } catch (e) {
+        // Ignore — environment endpoint may not exist
+      }
+    }
+
+    function startTimerCountdown() {
+      if (timerInterval) clearInterval(timerInterval);
+      timerInterval = setInterval(() => {
+        if (remainingSeconds !== null && remainingSeconds > 0) {
+          remainingSeconds--;
+          updateTimerDisplay();
+        }
+      }, 1000);
+      updateTimerDisplay();
+    }
+
+    function updateTimerDisplay() {
+      const display = document.getElementById('timerDisplay');
+      if (remainingSeconds === null || remainingSeconds <= 0) {
+        display.textContent = '00:00:00';
+        display.classList.add('warning');
+        return;
+      }
+      const h = Math.floor(remainingSeconds / 3600);
+      const m = Math.floor((remainingSeconds % 3600) / 60);
+      const s = remainingSeconds % 60;
+      display.textContent = `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+      display.classList.toggle('warning', remainingSeconds < 600);
+    }
+
+    async function extendShutdown() {
+      try {
+        const res = await fetch(apiUrl('/api/extend-shutdown'), { method: 'POST' });
+        const data = await res.json();
+        if (data.success) {
+          remainingSeconds = data.remainingSeconds;
+          updateTimerDisplay();
+          showToast('⏱ Shutdown extended by 1 hour', 'success');
+        } else {
+          showToast(data.error || 'Failed to extend', 'error');
+        }
+      } catch (e) {
+        showToast('Failed to extend shutdown', 'error');
+      }
+    }
+
+    async function shutdownNow() {
+      const isLocal = currentMode === 'local';
+      const msg = isLocal
+        ? 'Stop all Docker containers?'
+        : 'Shutdown the EC2 instance now?';
+
+      if (!confirm(msg)) return;
+
+      try {
+        const res = await fetch(apiUrl('/api/shutdown-now'), { method: 'POST' });
+        const data = await res.json();
+        showToast(data.message || 'Shutting down...', 'success');
+      } catch (e) {
+        showToast('Failed to shutdown', 'error');
+      }
+    }
+
+    // Initial fetch and auto-refresh
+    fetchStatus();
+    fetchEnvironment();
+    refreshTimer = setInterval(fetchStatus, 2000);
+    // Refresh environment every 30 seconds to sync timer
+    setInterval(fetchEnvironment, 30000);
+  </script>
+</body>
+</html>

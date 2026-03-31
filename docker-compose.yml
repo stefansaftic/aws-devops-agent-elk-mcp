@@ -1,0 +1,123 @@
+services:
+  # Elasticsearch - Single node with security enabled
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.3
+    container_name: elk-mcp-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=true
+      - xpack.security.http.ssl.enabled=false   # HTTP only (internal Docker network)
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - cluster.name=elk-mcp-demo
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-changeme}
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -u elastic:${ELASTIC_PASSWORD:-changeme} http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    networks:
+      - elk-mcp
+
+  # ES Setup - Runs once to create API keys for MCP server and demo service
+  # Runs as root (user: "0:0") so it can write to the shared volume.
+  # This is a one-shot init container that exits immediately after creating the keys.
+  es-setup:
+    image: curlimages/curl:latest
+    container_name: elk-mcp-es-setup
+    user: "0:0"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-changeme}
+    volumes:
+      - es-keys:/run/es-keys
+    networks:
+      - elk-mcp
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        echo '=== Creating Elasticsearch API keys ==='
+
+        MCP_KEY_RESPONSE=$$(curl -sf -X POST http://elasticsearch:9200/_security/api_key \
+          -u "elastic:$${ELASTIC_PASSWORD}" \
+          -H "Content-Type: application/json" \
+          -d '{"name":"mcp-server-key","role_descriptors":{"mcp-reader":{"cluster":["monitor"],"indices":[{"names":["*"],"privileges":["read","view_index_metadata","monitor"]}]}}}')
+        MCP_API_KEY=$$(echo "$$MCP_KEY_RESPONSE" | grep -o '"encoded":"[^"]*"' | cut -d'"' -f4)
+        echo "MCP_API_KEY=$$MCP_API_KEY" > /run/es-keys/mcp-server.env
+        echo "MCP server API key created: $$MCP_API_KEY"
+
+        DEMO_KEY_RESPONSE=$$(curl -sf -X POST http://elasticsearch:9200/_security/api_key \
+          -u "elastic:$${ELASTIC_PASSWORD}" \
+          -H "Content-Type: application/json" \
+          -d '{"name":"demo-service-key","role_descriptors":{"demo-writer":{"cluster":["monitor","manage_index_templates"],"indices":[{"names":["app-logs-*","access-logs-*","metrics-*"],"privileges":["create_index","index","write","manage"]}]}}}')
+        DEMO_API_KEY=$$(echo "$$DEMO_KEY_RESPONSE" | grep -o '"encoded":"[^"]*"' | cut -d'"' -f4)
+        echo "DEMO_API_KEY=$$DEMO_API_KEY" > /run/es-keys/demo-service.env
+        echo "Demo service API key created: $$DEMO_API_KEY"
+
+        echo '=== API keys created successfully ==='
+
+  # MCP Server - Streamable HTTP with OAuth 2.0
+  mcp-server:
+    build:
+      context: ./mcp-server
+      dockerfile: Dockerfile
+    container_name: elk-mcp-server
+    environment:
+      - MCP_SERVER_PORT=3000
+      - ES_URL=http://elasticsearch:9200
+      - ES_API_KEY_FILE=/run/es-keys/mcp-server.env
+      - OAUTH_CLIENT_ID=${OAUTH_CLIENT_ID:-devops-agent}
+      - OAUTH_CLIENT_SECRET=${OAUTH_CLIENT_SECRET:-demo-secret-change-me}
+      - JWT_SECRET=${JWT_SECRET:-jwt-secret-change-me-in-production}
+      - TOKEN_EXPIRY_SECONDS=${TOKEN_EXPIRY_SECONDS:-3600}
+      - OAUTH_ISSUER=${OAUTH_ISSUER:-elk-mcp-server}
+      - OAUTH_AUDIENCE=${OAUTH_AUDIENCE:-elk-mcp}
+    ports:
+      - "3000:3000"
+    volumes:
+      - es-keys:/run/es-keys:ro
+    depends_on:
+      es-setup:
+        condition: service_completed_successfully
+    networks:
+      - elk-mcp
+
+  # Demo Service - Log generator with web dashboard
+  demo-service:
+    build:
+      context: ./demo-service
+      dockerfile: Dockerfile
+    container_name: elk-mcp-demo-service
+    environment:
+      - DEMO_SERVICE_PORT=3001
+      - ES_URL=http://elasticsearch:9200
+      - ES_API_KEY_FILE=/run/es-keys/demo-service.env
+      - DEPLOY_ENV=${DEPLOY_ENV:-local}
+      - AUTO_SHUTDOWN_MINUTES=${AUTO_SHUTDOWN_MINUTES:-120}
+    ports:
+      - "3001:3001"
+    volumes:
+      - es-keys:/run/es-keys:ro
+      - ${DOCKER_SOCK:-/var/run/docker.sock}:/var/run/docker.sock
+    depends_on:
+      es-setup:
+        condition: service_completed_successfully
+    networks:
+      - elk-mcp
+
+volumes:
+  es-data:
+    driver: local
+  es-keys:
+    driver: local
+
+networks:
+  elk-mcp:
+    driver: bridge
